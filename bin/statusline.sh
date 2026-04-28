@@ -155,31 +155,6 @@ pct_color=$(color_for_pct "$pct_used")
 cwd=$(echo "$input" | jq -r '.cwd // ""')
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
 
-# Prefer an active worktree if Claude has been operating inside one recently.
-transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
-if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] \
-   && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    recent_lines=$(tail -200 "$transcript_path" 2>/dev/null)
-    active_wt=""
-    active_wt_pos=0
-    while IFS= read -r wt_path; do
-        [ -z "$wt_path" ] && continue
-        [ "$wt_path" = "$cwd" ] && continue
-        candidates=("$wt_path")
-        [[ "$wt_path" == /private/* ]] && candidates+=("${wt_path#/private}")
-        pos=0
-        for c in "${candidates[@]}"; do
-            p=$(printf '%s\n' "$recent_lines" | grep -nF "$c" | tail -1 | cut -d: -f1)
-            [ -n "$p" ] && [ "$p" -gt "$pos" ] && pos=$p
-        done
-        if [ "$pos" -gt "$active_wt_pos" ]; then
-            active_wt="$wt_path"
-            active_wt_pos="$pos"
-        fi
-    done < <(git -C "$cwd" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
-    [ -n "$active_wt" ] && cwd="${active_wt#/private}"
-fi
-
 display_path="${cwd/#$HOME/\~}"
 
 git_branch=""
