@@ -58,26 +58,50 @@ format_epoch_time() {
     local result=""
     case "$style" in
         time)
-            result=$(date -j -r "$epoch" +"%l:%M%p" 2>/dev/null)
-            [ -z "$result" ] && result=$(date -d "@$epoch" +"%l:%M%P" 2>/dev/null)
-            result=$(echo "$result" | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]')
+            result=$(date -j -r "$epoch" +"%H:%M" 2>/dev/null)
+            [ -z "$result" ] && result=$(date -d "@$epoch" +"%H:%M" 2>/dev/null)
             ;;
         datetime)
-            result=$(date -j -r "$epoch" +"%b %-d, %l:%M%p" 2>/dev/null)
-            [ -z "$result" ] && result=$(date -d "@$epoch" +"%b %-d, %l:%M%P" 2>/dev/null)
-            result=$(echo "$result" | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]')
+            result=$(date -j -r "$epoch" +"%-m/%-d %H:%M" 2>/dev/null)
+            [ -z "$result" ] && result=$(date -d "@$epoch" +"%-m/%-d %H:%M" 2>/dev/null)
             ;;
         *)
-            result=$(date -j -r "$epoch" +"%b %-d" 2>/dev/null)
-            [ -z "$result" ] && result=$(date -d "@$epoch" +"%b %-d" 2>/dev/null)
-            result=$(echo "$result" | tr '[:upper:]' '[:lower:]')
+            result=$(date -j -r "$epoch" +"%-m/%-d" 2>/dev/null)
+            [ -z "$result" ] && result=$(date -d "@$epoch" +"%-m/%-d" 2>/dev/null)
             ;;
     esac
     printf "%s" "$result"
 }
 
+format_remaining() {
+    local epoch=$1
+    [ -z "$epoch" ] || [ "$epoch" = "null" ] || [ "$epoch" = "0" ] && return
+
+    local now_epoch
+    now_epoch=$(date +%s)
+    local diff=$(( epoch - now_epoch ))
+    [ "$diff" -lt 0 ] && diff=0
+
+    local days=$(( diff / 86400 ))
+    local hours=$(( (diff % 86400) / 3600 ))
+    local minutes=$(( (diff % 3600) / 60 ))
+
+    if [ "$days" -gt 0 ]; then
+        printf "%d日と%d時間%d分後" "$days" "$hours" "$minutes"
+    elif [ "$hours" -gt 0 ]; then
+        printf "%d時間%d分後" "$hours" "$minutes"
+    else
+        printf "%d分後" "$minutes"
+    fi
+}
+
 iso_to_epoch() {
     local iso_str="$1"
+
+    if [[ "$iso_str" =~ ^[0-9]+$ ]]; then
+        echo "$iso_str"
+        return 0
+    fi
 
     local epoch
     epoch=$(date -d "${iso_str}" +%s 2>/dev/null)
@@ -124,24 +148,51 @@ else
     pct_used=0
 fi
 
-effort="default"
-settings_path="$HOME/.claude/settings.json"
-if [ -f "$settings_path" ]; then
-    effort=$(jq -r '.effortLevel // "default"' "$settings_path" 2>/dev/null)
-fi
+effort=$(echo "$input" | jq -r '.effort.level // empty')
 
 # ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
 pct_color=$(color_for_pct "$pct_used")
 cwd=$(echo "$input" | jq -r '.cwd // ""')
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
-dirname=$(basename "$cwd")
+
+# Prefer an active worktree if Claude has been operating inside one recently.
+transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] \
+   && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    recent_lines=$(tail -200 "$transcript_path" 2>/dev/null)
+    active_wt=""
+    active_wt_pos=0
+    while IFS= read -r wt_path; do
+        [ -z "$wt_path" ] && continue
+        [ "$wt_path" = "$cwd" ] && continue
+        candidates=("$wt_path")
+        [[ "$wt_path" == /private/* ]] && candidates+=("${wt_path#/private}")
+        pos=0
+        for c in "${candidates[@]}"; do
+            p=$(printf '%s\n' "$recent_lines" | grep -nF "$c" | tail -1 | cut -d: -f1)
+            [ -n "$p" ] && [ "$p" -gt "$pos" ] && pos=$p
+        done
+        if [ "$pos" -gt "$active_wt_pos" ]; then
+            active_wt="$wt_path"
+            active_wt_pos="$pos"
+        fi
+    done < <(git -C "$cwd" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+    [ -n "$active_wt" ] && cwd="${active_wt#/private}"
+fi
+
+display_path="${cwd/#$HOME/\~}"
 
 git_branch=""
 git_dirty=""
+git_worktree=""
 if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git_branch=$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null)
     if [ -n "$(git -C "$cwd" --no-optional-locks status --porcelain 2>/dev/null)" ]; then
         git_dirty="*"
+    fi
+    git_dir=$(git -C "$cwd" rev-parse --git-dir 2>/dev/null)
+    if [[ "$git_dir" == *"/worktrees/"* ]]; then
+        git_worktree=" ⎇ wt"
     fi
 fi
 
@@ -172,21 +223,21 @@ line1="${blue}${model_name}${reset}"
 line1+="${sep}"
 line1+="✍️ ${pct_color}${pct_used}%${reset}"
 line1+="${sep}"
-line1+="${skip_perms}${cyan}${dirname}${reset}"
+line1+="${skip_perms}${cyan}${display_path}${reset}"
 if [ -n "$git_branch" ]; then
     line1+=" ${green}(${git_branch}${red}${git_dirty}${green})${reset}"
+fi
+if [ -n "$git_worktree" ]; then
+    line1+="${yellow}${git_worktree}${reset}"
 fi
 if [ -n "$session_duration" ]; then
     line1+="${sep}"
     line1+="${dim}⏱ ${reset}${white}${session_duration}${reset}"
 fi
-line1+="${sep}"
-case "$effort" in
-    high)   line1+="${magenta}● ${effort}${reset}" ;;
-    medium) line1+="${dim}◑ ${effort}${reset}" ;;
-    low)    line1+="${dim}◔ ${effort}${reset}" ;;
-    *)      line1+="${dim}◑ ${effort}${reset}" ;;
-esac
+if [ -n "$effort" ]; then
+    line1+="${sep}"
+    line1+="🔥 ${magenta}${effort}${reset}"
+fi
 
 # ── Rate limits from stdin (primary) ───────────────────
 has_stdin_rates=false
@@ -199,9 +250,9 @@ stdin_five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage /
 if [ -n "$stdin_five_pct" ]; then
     has_stdin_rates=true
     five_hour_pct=$(printf "%.0f" "$stdin_five_pct")
-    five_hour_reset_epoch=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
+    five_hour_reset_epoch=$(iso_to_epoch "$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')")
     seven_day_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | awk '{printf "%.0f", $1}')
-    seven_day_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
+    seven_day_reset_epoch=$(iso_to_epoch "$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')")
 fi
 
 # ── Fallback: API call (cached) ────────────────────────
@@ -256,7 +307,7 @@ if ! $has_stdin_rates; then
                 -H "Content-Type: application/json" \
                 -H "Authorization: Bearer $token" \
                 -H "anthropic-beta: oauth-2025-04-20" \
-                -H "User-Agent: claude-code/2.1.34" \
+                -H "User-Agent: claude-code" \
                 "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
             if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
                 usage_data="$response"
@@ -293,23 +344,29 @@ bar_width=10
 
 if [ -n "$five_hour_pct" ]; then
     five_hour_reset=$(format_epoch_time "$five_hour_reset_epoch" "time")
+    five_hour_remaining=$(format_remaining "$five_hour_reset_epoch")
     five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
     five_hour_pct_color=$(color_for_pct "$five_hour_pct")
     five_hour_pct_fmt=$(printf "%3d" "$five_hour_pct")
 
-    rate_lines+="${white}current${reset} ${five_hour_bar} ${five_hour_pct_color}${five_hour_pct_fmt}%${reset}"
-    [ -n "$five_hour_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${five_hour_reset}${reset}"
+    rate_lines+="${five_hour_pct_color}current${reset} ${five_hour_bar} ${five_hour_pct_color}${five_hour_pct_fmt}%${reset}"
+    if [ -n "$five_hour_reset" ]; then
+        rate_lines+=" ${dim}${five_hour_reset}（${five_hour_remaining}）にリセット${reset}"
+    fi
 fi
 
 if [ -n "$seven_day_pct" ]; then
     seven_day_reset=$(format_epoch_time "$seven_day_reset_epoch" "datetime")
+    seven_day_remaining=$(format_remaining "$seven_day_reset_epoch")
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
     seven_day_pct_fmt=$(printf "%3d" "$seven_day_pct")
 
     [ -n "$rate_lines" ] && rate_lines+="\n"
-    rate_lines+="${white}weekly${reset}  ${seven_day_bar} ${seven_day_pct_color}${seven_day_pct_fmt}%${reset}"
-    [ -n "$seven_day_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${seven_day_reset}${reset}"
+    rate_lines+="${seven_day_pct_color}weekly${reset}  ${seven_day_bar} ${seven_day_pct_color}${seven_day_pct_fmt}%${reset}"
+    if [ -n "$seven_day_reset" ]; then
+        rate_lines+=" ${dim}${seven_day_reset}（${seven_day_remaining}）にリセット${reset}"
+    fi
 fi
 
 if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
